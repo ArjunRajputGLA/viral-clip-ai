@@ -16,11 +16,11 @@ const Preview = () => {
   useEffect(() => {
     if (!id) return;
     const fetch = async () => {
-      const { data: p } = await supabase.from('projects').select('*').eq('id', id).single();
+      const { data: p } = await supabase.from('projects').select('*').eq('id', id).maybeSingle();
       setProject(p);
-      const { data: gv } = await supabase.from('generated_videos').select('*').eq('project_id', id).order('created_at', { ascending: false }).limit(1).single();
+      const { data: gv } = await supabase.from('generated_videos').select('*').eq('project_id', id).order('created_at', { ascending: false }).limit(1).maybeSingle();
       setGeneratedVideo(gv);
-      const { data: rv } = await supabase.from('raw_videos').select('*').eq('project_id', id).limit(1).single();
+      const { data: rv } = await supabase.from('raw_videos').select('*').eq('project_id', id).limit(1).maybeSingle();
       setRawVideo(rv);
     };
     fetch();
