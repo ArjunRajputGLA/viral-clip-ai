@@ -7,8 +7,10 @@ import type { Tables } from '@/integrations/supabase/types';
 
 const STEPS = [
   { key: 'processing', label: 'Uploading & Preparing' },
-  { key: 'transcribing', label: 'Transcribing Audio' },
+  { key: 'transcribing', label: 'Transcribing Audio (Deepgram)' },
+  { key: 'transcribed', label: 'Transcription Complete' },
   { key: 'detecting', label: 'Detecting Viral Moment' },
+  { key: 'segment_selected', label: 'Viral Segment Selected' },
   { key: 'clipping', label: 'Clipping Video' },
   { key: 'rendering', label: 'Rendering Final Video' },
 ];
