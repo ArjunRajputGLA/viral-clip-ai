@@ -10,7 +10,8 @@ const corsHeaders = {
 // ── Deepgram Transcription ──────────────────────────────────────────────
 async function transcribeVideo(
   videoUrl: string,
-  deepgramKey: string
+  deepgramKey: string,
+  workerUrl: string
 ): Promise<{ transcript: string; duration: number; segments: { start: number; end: number; text: string }[]; words: any[]; warning?: string }> {
 
   console.log(`[transcribe] Starting transcription process...`);
@@ -20,8 +21,8 @@ async function transcribeVideo(
 
   try {
     // 1. Try to extract clean audio first
-    console.log(`[transcribe] Requesting audio extraction from worker...`);
-    const workerRes = await fetch("http://localhost:4000/extract-audio", {
+    console.log(`[transcribe] Requesting audio extraction from worker: ${workerUrl}`);
+    const workerRes = await fetch(`${workerUrl}/extract-audio`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ inputUrl: videoUrl })
@@ -325,6 +326,20 @@ serve(async (req) => {
     const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
     const lovableKey = Deno.env.get("LOVABLE_API_KEY")!;
     const deepgramKey = Deno.env.get("DEEPGRAM_API_KEY");
+    // Default to host.docker.internal for local dev if not set
+    const workerUrl = Deno.env.get("FFMPEG_WORKER_URL") || "http://host.docker.internal:4000";
+
+    console.log(`[worker] Using FFmpeg worker at: ${workerUrl}`);
+
+    // Health check
+    try {
+      console.log(`[worker] Pinging ${workerUrl}...`);
+      const ping = await fetch(workerUrl);
+      if (ping.ok) console.log("[worker] response OK");
+      else console.warn(`[worker] Ping failed: ${ping.status} ${ping.statusText}`);
+    } catch (e: any) {
+      console.warn(`[worker] Health check failed: ${e.message}`);
+    }
 
     // Debugging: Log key status (never log full key)
     if (!deepgramKey) {
@@ -375,7 +390,7 @@ serve(async (req) => {
     await logStep("transcribing", "Starting Deepgram transcription (nova-2)...");
     await updateStatus("transcribing");
 
-    const transcriptionResult = await transcribeVideo(videoUrlForDeepgram, deepgramKey);
+    const transcriptionResult = await transcribeVideo(videoUrlForDeepgram, deepgramKey, workerUrl);
     const { transcript, duration, segments, words } = transcriptionResult;
 
     // Generate Captions (3-6 words, max 2.5s)
@@ -460,12 +475,12 @@ serve(async (req) => {
     const renderId = `${project_id}_${Date.now()}`;
     const outputName = `${project_id}/${renderId}.mp4`;
 
-    console.log(`[clipping] calling worker at http://localhost:4000/clip`);
+    console.log(`[clipping] calling worker at ${workerUrl}/clip`);
 
-    // Call user's local FFmpeg worker
+    // Call user's local/remote FFmpeg worker
     let clippedUrl = "";
     try {
-      const workerRes = await fetch("http://localhost:4000/clip", {
+      const workerRes = await fetch(`${workerUrl}/clip`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
