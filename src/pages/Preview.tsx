@@ -49,6 +49,7 @@ const Preview = () => {
               videoUrl={generatedVideo?.video_url || null}
               captionsJson={(rawVideo as any)?.captions_json}
               wordTimestamps={(rawVideo as any)?.word_timestamps}
+              fallbackCaptionText={generatedVideo?.captions || undefined}
             />
           </div>
 

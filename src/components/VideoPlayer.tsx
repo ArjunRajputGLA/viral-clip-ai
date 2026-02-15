@@ -1,53 +1,101 @@
-
-import React, { useRef, useState, useEffect, useMemo } from 'react';
+import React, { useRef, useState, useEffect, useMemo, useCallback } from 'react';
 import { Play, Pause, Volume2, VolumeX, Maximize, FileText, Smartphone, Monitor, Square } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Slider } from '@/components/ui/slider';
 import { cn } from '@/lib/utils';
-import type { Tables } from '@/integrations/supabase/types';
+
+interface CaptionWord {
+    word: string;
+    start: number;
+    end: number;
+}
+
+interface CaptionSegment {
+    start: number;
+    end: number;
+    text: string;
+    words: CaptionWord[];
+}
 
 interface VideoPlayerProps {
     videoUrl: string | null;
-    captionsJson: any | null; // The new 3-6 word groupings
-    wordTimestamps: any | null; // The raw word timestamps
+    captionsJson: CaptionSegment[] | null;
+    wordTimestamps: any | null;
+    fallbackCaptionText?: string;
     className?: string;
 }
 
 type AspectRatio = '9/16' | '1/1' | '16/9';
 type CaptionStyle = 'default' | 'bounce' | 'pop' | 'fade';
 
-export const VideoPlayer: React.FC<VideoPlayerProps> = ({ videoUrl, captionsJson, wordTimestamps, className }) => {
+const OVERLAP_MS = 150; // ms to keep previous caption visible for crossfade
+
+export const VideoPlayer: React.FC<VideoPlayerProps> = ({
+    videoUrl,
+    captionsJson,
+    wordTimestamps,
+    fallbackCaptionText,
+    className
+}) => {
     const videoRef = useRef<HTMLVideoElement>(null);
     const [isPlaying, setIsPlaying] = useState(false);
     const [currentTime, setCurrentTime] = useState(0);
     const [duration, setDuration] = useState(0);
-    const [volume, setVolume] = useState(1);
     const [isMuted, setIsMuted] = useState(false);
     const [showCaptions, setShowCaptions] = useState(true);
     const [aspectRatio, setAspectRatio] = useState<AspectRatio>('9/16');
     const [captionStyle, setCaptionStyle] = useState<CaptionStyle>('bounce');
+    const [activeIndex, setActiveIndex] = useState<number>(-1);
+    const [prevIndex, setPrevIndex] = useState<number>(-1);
+    const [showControls, setShowControls] = useState(true);
+    const controlsTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-    // Sync state with video
+    // Debug: log caption load
     useEffect(() => {
-        const video = videoRef.current;
-        if (!video) return;
+        if (captionsJson && Array.isArray(captionsJson)) {
+            console.log(`[captions] loaded segments = ${captionsJson.length}`);
+        }
+    }, [captionsJson]);
 
-        const handleTimeUpdate = () => setCurrentTime(video.currentTime);
-        const handleLoadedMetadata = () => setDuration(video.duration);
-        const handleEnded = () => setIsPlaying(false);
+    // ── Caption sync: find active segment by currentTime ──
+    useEffect(() => {
+        if (!captionsJson || !Array.isArray(captionsJson) || captionsJson.length === 0) {
+            setActiveIndex(-1);
+            return;
+        }
 
-        video.addEventListener('timeupdate', handleTimeUpdate);
-        video.addEventListener('loadedmetadata', handleLoadedMetadata);
-        video.addEventListener('ended', handleEnded);
+        const idx = captionsJson.findIndex(
+            (c) => currentTime >= c.start && currentTime <= c.end
+        );
 
-        return () => {
-            video.removeEventListener('timeupdate', handleTimeUpdate);
-            video.removeEventListener('loadedmetadata', handleLoadedMetadata);
-            video.removeEventListener('ended', handleEnded);
-        };
+        if (idx !== activeIndex) {
+            // Crossfade: keep previous visible briefly
+            if (activeIndex >= 0 && idx >= 0) {
+                setPrevIndex(activeIndex);
+                setTimeout(() => setPrevIndex(-1), OVERLAP_MS);
+            }
+            setActiveIndex(idx);
+            console.log(`[captions] currentTime = ${currentTime.toFixed(2)} activeIndex = ${idx}`);
+        }
+    }, [currentTime, captionsJson, activeIndex]);
+
+    const activeCaption: CaptionSegment | null = useMemo(() => {
+        if (!captionsJson || activeIndex < 0) return null;
+        return captionsJson[activeIndex] ?? null;
+    }, [captionsJson, activeIndex]);
+
+    // ── Video event handlers ──
+    const handleTimeUpdate = useCallback(() => {
+        if (videoRef.current) setCurrentTime(videoRef.current.currentTime);
     }, []);
 
-    const togglePlay = () => {
+    const handleLoadedMetadata = useCallback(() => {
+        if (videoRef.current) setDuration(videoRef.current.duration);
+    }, []);
+
+    const handleEnded = useCallback(() => setIsPlaying(false), []);
+
+    const togglePlay = useCallback(() => {
         if (videoRef.current) {
             if (isPlaying) {
                 videoRef.current.pause();
@@ -56,23 +104,23 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ videoUrl, captionsJson
             }
             setIsPlaying(!isPlaying);
         }
-    };
+    }, [isPlaying]);
 
-    const handleSeek = (value: number[]) => {
+    const handleSeek = useCallback((value: number[]) => {
         if (videoRef.current) {
             videoRef.current.currentTime = value[0];
             setCurrentTime(value[0]);
         }
-    };
+    }, []);
 
-    const toggleMute = () => {
+    const toggleMute = useCallback(() => {
         if (videoRef.current) {
             videoRef.current.muted = !isMuted;
             setIsMuted(!isMuted);
         }
-    };
+    }, [isMuted]);
 
-    const toggleFullscreen = () => {
+    const toggleFullscreen = useCallback(() => {
         if (videoRef.current) {
             if (document.fullscreenElement) {
                 document.exitFullscreen();
@@ -80,13 +128,58 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ videoUrl, captionsJson
                 videoRef.current.parentElement?.requestFullscreen();
             }
         }
+    }, []);
+
+    // Auto-hide controls after 3s of inactivity
+    const resetControlsTimer = useCallback(() => {
+        setShowControls(true);
+        if (controlsTimeout.current) clearTimeout(controlsTimeout.current);
+        controlsTimeout.current = setTimeout(() => setShowControls(false), 3000);
+    }, []);
+
+    // ── Render caption text with karaoke highlighting ──
+    const renderKaraokeWords = (caption: CaptionSegment) => {
+        if (!caption.words || caption.words.length === 0) {
+            return <span>{caption.text}</span>;
+        }
+
+        return caption.words.map((w, idx) => {
+            const isActive = currentTime >= w.start && currentTime <= w.end;
+            const isPast = currentTime > w.end;
+
+            return (
+                <span
+                    key={`${caption.start}-${idx}`}
+                    className={cn(
+                        "inline-block mx-0.5 transition-all duration-150 ease-out",
+                        isActive && "text-yellow-300 scale-110 drop-shadow-[0_0_8px_rgba(250,204,21,0.6)]",
+                        isPast && "text-white",
+                        !isActive && !isPast && "text-white/50"
+                    )}
+                    style={isActive ? { transform: 'scale(1.12)' } : undefined}
+                >
+                    {w.word}
+                </span>
+            );
+        });
     };
 
-    // Find active caption segment
-    const activeCaption = useMemo(() => {
-        if (!captionsJson || !Array.isArray(captionsJson)) return null;
-        return captionsJson.find((c: any) => currentTime >= c.start && currentTime <= c.end);
-    }, [captionsJson, currentTime]);
+    // ── Animation class based on style ──
+    const getAnimationClass = (style: CaptionStyle) => {
+        switch (style) {
+            case 'bounce': return 'animate-bounce-subtle';
+            case 'pop': return 'animate-pop-in';
+            case 'fade': return 'animate-fade-in';
+            default: return 'animate-fade-in';
+        }
+    };
+
+    // Format time for display
+    const formatTime = (t: number) => {
+        const m = Math.floor(t / 60);
+        const s = Math.floor(t % 60);
+        return `${m}:${s.toString().padStart(2, '0')}`;
+    };
 
     return (
         <div className={cn("flex flex-col gap-4", className)}>
@@ -104,20 +197,26 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ videoUrl, captionsJson
             </div>
 
             {/* Phone Frame Container */}
-            <div className="relative mx-auto bg-black rounded-3xl overflow-hidden shadow-2xl border-8 border-gray-900"
+            <div
+                className="relative mx-auto bg-black rounded-3xl overflow-hidden shadow-2xl border-8 border-gray-900 group"
                 style={{
                     aspectRatio: aspectRatio === '9/16' ? '9/16' : aspectRatio === '1/1' ? '1/1' : '16/9',
                     maxHeight: '80vh',
                     width: aspectRatio === '16/9' ? '100%' : 'auto',
                     maxWidth: aspectRatio === '16/9' ? '900px' : '400px'
                 }}
+                onMouseMove={resetControlsTimer}
+                onTouchStart={resetControlsTimer}
             >
                 {videoUrl ? (
                     <video
                         ref={videoRef}
                         src={videoUrl}
-                        className="w-full h-full object-cover"
+                        className="w-full h-full object-cover cursor-pointer"
                         onClick={togglePlay}
+                        onTimeUpdate={handleTimeUpdate}
+                        onLoadedMetadata={handleLoadedMetadata}
+                        onEnded={handleEnded}
                     />
                 ) : (
                     <div className="w-full h-full flex items-center justify-center bg-gray-900 text-gray-500">
@@ -125,38 +224,49 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ videoUrl, captionsJson
                     </div>
                 )}
 
-                {/* Captions Overlay */}
-                {showCaptions && activeCaption && (
-                    <div className="absolute bottom-20 left-0 right-0 px-6 text-center pointer-events-none">
-                        <div className={cn(
-                            "inline-block bg-black/60 backdrop-blur-sm px-4 py-2 rounded-xl text-white font-bold text-lg md:text-xl transition-all duration-200",
-                            captionStyle === 'bounce' && "animate-bounce-subtle",
-                            captionStyle === 'pop' && "animate-pop-in",
-                            captionStyle === 'fade' && "animate-fade-in"
-                        )}>
-                            {activeCaption.words?.map((wordObj: any, idx: number) => {
-                                const isActive = currentTime >= wordObj.start && currentTime <= wordObj.end;
-                                const isPast = currentTime > wordObj.end;
+                {/* ── CAPTION OVERLAY ── */}
+                {showCaptions && (
+                    <div className="absolute bottom-16 left-0 right-0 px-4 text-center pointer-events-none z-10">
+                        {/* Active caption */}
+                        {activeCaption ? (
+                            <div
+                                key={`caption-${activeIndex}`}
+                                className={cn(
+                                    "inline-block max-w-[85%] bg-black/70 backdrop-blur-md px-5 py-3 rounded-2xl",
+                                    "text-white font-bold text-lg md:text-xl leading-relaxed",
+                                    "shadow-lg border border-white/10",
+                                    getAnimationClass(captionStyle)
+                                )}
+                            >
+                                {renderKaraokeWords(activeCaption)}
+                            </div>
+                        ) : fallbackCaptionText ? (
+                            /* FALLBACK: static caption text if no timestamped data */
+                            <div className="inline-block max-w-[85%] bg-black/70 backdrop-blur-md px-5 py-3 rounded-2xl text-white font-bold text-lg opacity-60">
+                                {fallbackCaptionText}
+                            </div>
+                        ) : null}
 
-                                return (
-                                    <span key={idx} className={cn(
-                                        "mx-1 transition-colors duration-150",
-                                        isActive ? "text-yellow-400 scale-110 inline-block" : isPast ? "text-white" : "text-white/60"
-                                    )}>
-                                        {wordObj.word}
-                                    </span>
-                                );
-                            })}
-                        </div>
+                        {/* Previous caption fading out (crossfade overlap) */}
+                        {prevIndex >= 0 && captionsJson && captionsJson[prevIndex] && (
+                            <div className="absolute inset-0 flex items-end justify-center px-4 pb-0 pointer-events-none">
+                                <div className="inline-block max-w-[85%] bg-black/70 backdrop-blur-md px-5 py-3 rounded-2xl text-white font-bold text-lg md:text-xl opacity-0 transition-opacity duration-150">
+                                    {captionsJson[prevIndex].text}
+                                </div>
+                            </div>
+                        )}
                     </div>
                 )}
 
-                {/* Custom Controls Overlay */}
-                <div className="absolute bottom-0 left-0 right-0 p-4 bg-gradient-to-t from-black/80 to-transparent transition-opacity duration-300 opacity-0 hover:opacity-100 peer-hover:opacity-100">
+                {/* ── CONTROLS OVERLAY ── */}
+                <div className={cn(
+                    "absolute bottom-0 left-0 right-0 p-4 bg-gradient-to-t from-black/80 via-black/40 to-transparent transition-opacity duration-300",
+                    showControls || !isPlaying ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+                )}>
                     <div className="flex flex-col gap-2">
                         <Slider
                             value={[currentTime]}
-                            max={duration}
+                            max={duration || 1}
                             step={0.1}
                             onValueChange={handleSeek}
                             className="w-full"
@@ -169,20 +279,17 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ videoUrl, captionsJson
                                 </Button>
 
                                 <span className="text-xs font-mono">
-                                    {Math.floor(currentTime / 60)}:{Math.floor(currentTime % 60).toString().padStart(2, '0')} /
-                                    {Math.floor(duration / 60)}:{Math.floor(duration % 60).toString().padStart(2, '0')}
+                                    {formatTime(currentTime)} / {formatTime(duration)}
                                 </span>
                             </div>
 
-                            <div className="flex items-center gap-2">
-                                <Button variant="ghost" size="icon" onClick={() => setShowCaptions(!showCaptions)} className={cn("h-8 w-8 hover:bg-white/20", showCaptions ? "text-yellow-400" : "text-white")}>
+                            <div className="flex items-center gap-1">
+                                <Button variant="ghost" size="icon" onClick={() => setShowCaptions(!showCaptions)} className={cn("h-8 w-8 hover:bg-white/20", showCaptions ? "text-yellow-400" : "text-white/60")}>
                                     <FileText className="h-4 w-4" />
                                 </Button>
-
                                 <Button variant="ghost" size="icon" onClick={toggleMute} className="h-8 w-8 text-white hover:bg-white/20">
                                     {isMuted ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
                                 </Button>
-
                                 <Button variant="ghost" size="icon" onClick={toggleFullscreen} className="h-8 w-8 text-white hover:bg-white/20">
                                     <Maximize className="h-4 w-4" />
                                 </Button>
@@ -193,12 +300,19 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({ videoUrl, captionsJson
             </div>
 
             {/* Caption Style Selector */}
-            <div className="flex justify-center gap-2 mt-4">
-                <span className="text-sm text-muted-foreground self-center mr-2">Caption Style:</span>
-                <Button variant={captionStyle === 'default' ? "secondary" : "ghost"} size="sm" onClick={() => setCaptionStyle('default')}>Default</Button>
-                <Button variant={captionStyle === 'bounce' ? "secondary" : "ghost"} size="sm" onClick={() => setCaptionStyle('bounce')}>Bounce</Button>
-                <Button variant={captionStyle === 'pop' ? "secondary" : "ghost"} size="sm" onClick={() => setCaptionStyle('pop')}>Pop</Button>
-                <Button variant={captionStyle === 'fade' ? "secondary" : "ghost"} size="sm" onClick={() => setCaptionStyle('fade')}>Fade</Button>
+            <div className="flex justify-center gap-2 mt-2">
+                <span className="text-xs text-muted-foreground self-center mr-2 uppercase tracking-wider">Style:</span>
+                {(['default', 'bounce', 'pop', 'fade'] as CaptionStyle[]).map((s) => (
+                    <Button
+                        key={s}
+                        variant={captionStyle === s ? "secondary" : "ghost"}
+                        size="sm"
+                        onClick={() => setCaptionStyle(s)}
+                        className="text-xs capitalize"
+                    >
+                        {s}
+                    </Button>
+                ))}
             </div>
         </div>
     );

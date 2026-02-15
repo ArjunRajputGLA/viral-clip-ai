@@ -11,59 +11,126 @@ const corsHeaders = {
 async function transcribeVideo(
   videoUrl: string,
   deepgramKey: string
-): Promise<{ transcript: string; duration: number; segments: { start: number; end: number; text: string }[]; words: any[] }> {
-  // STEP 4 -- ADD DEBUG LOGGING
-  console.log("[transcribe] downloading video locally");
+): Promise<{ transcript: string; duration: number; segments: { start: number; end: number; text: string }[]; words: any[]; warning?: string }> {
 
-  // STEP 1 -- DOWNLOAD VIDEO INSIDE EDGE FUNCTION
-  const response = await fetch(videoUrl);
-  if (response.status !== 200) {
-    throw new Error(`Video fetch failed with status ${response.status}`);
+  console.log(`[transcribe] Starting transcription process...`);
+
+  let mediaBuffer: ArrayBuffer;
+  let contentType: string;
+
+  try {
+    // 1. Try to extract clean audio first
+    console.log(`[transcribe] Requesting audio extraction from worker...`);
+    const workerRes = await fetch("http://localhost:4000/extract-audio", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ inputUrl: videoUrl })
+    });
+
+    if (!workerRes.ok) throw new Error(`Worker returned ${workerRes.status}`);
+
+    const { audioUrl } = await workerRes.json();
+    console.log(`[transcribe] Audio extracted successfully: ${audioUrl}`);
+
+    const audioResp = await fetch(audioUrl);
+    if (!audioResp.ok) throw new Error(`Failed to download extracted audio`);
+
+    mediaBuffer = await audioResp.arrayBuffer();
+    contentType = "audio/wav";
+    console.log(`[transcribe] Using extracted WAV audio (${mediaBuffer.byteLength} bytes)`);
+
+    // 3. Validate Audio Dictionary
+    if (mediaBuffer.byteLength < 10000) {
+      console.warn(`[transcribe] Audio file too small (${mediaBuffer.byteLength} bytes). Possibly silent.`);
+      return {
+        transcript: "",
+        duration: 0,
+        segments: [],
+        words: [],
+        warning: "audio_too_small"
+      };
+    }
+
+  } catch (err: any) {
+    console.error(`[transcribe] CRITICAL: Audio extraction failed: ${err.message}`);
+    // Strict requirement: Never use raw video. Fail safely.
+    return {
+      transcript: "",
+      duration: 0,
+      segments: [],
+      words: [],
+      warning: "audio_extraction_failed"
+    };
   }
 
-  const buffer = await response.arrayBuffer();
-  console.log(`[transcribe] video size = ${buffer.byteLength} bytes`);
+  const attemptTranscription = async (model: string) => {
+    console.log(`[transcribe] Attempting with model: ${model}`);
+    const deepgramResponse = await fetch(`https://api.deepgram.com/v1/listen?model=${model}&smart_format=true&punctuate=true&utterances=true&words=true`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Token ${deepgramKey}`,
+        "Content-Type": contentType
+      },
+      body: mediaBuffer
+    });
 
-  if (buffer.byteLength < 10000) {
-    throw new Error("Video fetch failed or empty");
+    if (!deepgramResponse.ok) {
+      const err = await deepgramResponse.text();
+      console.warn(`[transcribe] Model ${model} failed: ${err}`);
+      return null;
+    }
+
+    const result = await deepgramResponse.json();
+    return result;
+  };
+
+  // Attempt 1: Nova-2
+  let data = await attemptTranscription('nova-2');
+
+  // Attempt 2: General (if attempt 1 failed or returned empty transcript)
+  const istranscriptEmpty = (d: any) => !d?.results?.channels?.[0]?.alternatives?.[0]?.transcript;
+
+  if (!data || istranscriptEmpty(data)) {
+    console.log(`[transcribe] Nova-2 failed or empty, retrying with 'general' model...`);
+    data = await attemptTranscription('general');
   }
 
-  // STEP 2 -- SEND RAW BYTES TO DEEPGRAM
-  console.log("[transcribe] sending binary to Deepgram");
-
-  // STEP 1 -- ENABLE WORD TIMESTAMPS IN DEEPGRAM REQUEST
-  const deepgramRes = await fetch("https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&punctuate=true&utterances=true&words=true", {
-    method: "POST",
-    headers: {
-      "Authorization": `Token ${deepgramKey}`,
-      "Content-Type": "application/octet-stream",
-    },
-    body: new Uint8Array(buffer),
-  });
-
-  // STEP 3 -- PARSE RESPONSE SAFELY
-  const json = await deepgramRes.json();
-
-  const transcript = json?.results?.channels?.[0]?.alternatives?.[0]?.transcript || "";
-  const duration = json?.metadata?.duration || 0;
-
-  console.log(`[transcribe] Deepgram duration = ${duration}`);
-  console.log(`[transcribe] transcript length = ${transcript.length}`);
-
-  if (!transcript || transcript.trim() === "") {
-    console.log("[transcribe] Full Deepgram response:", JSON.stringify(json));
-    console.log(`[transcribe] Metadata duration: ${json?.metadata?.duration}`);
-    throw new Error("Deepgram returned empty transcript");
+  // Fallback: If still failed
+  if (!data || istranscriptEmpty(data)) {
+    console.warn(`[transcribe] All attempts failed. Returning empty transcript fallback.`);
+    // Try to guess duration from buffer size as a rough proxy if needed, 
+    // but better to just return 0 or a nominal value if we can't get it.
+    // Actually, deepgram usually detects duration even if no speech. 
+    // If request failed entirely, we might not have duration.
+    return {
+      transcript: "",
+      duration: 0,
+      segments: [],
+      words: [],
+      warning: "empty_transcript"
+    };
   }
 
-  // STEP 3 -- BUILD STRUCTURED TRANSCRIPT
-  // Extract word timestamps
-  const words = json.results?.channels?.[0]?.alternatives?.[0]?.words || [];
+  const resultData = data.results?.channels?.[0]?.alternatives?.[0];
+  const transcript = resultData?.transcript || "";
+  const duration = data.metadata?.duration || 0;
+  const words = resultData?.words || [];
+
+  // Group words into segments (basic sentence splitting)
   let segments: { start: number; end: number; text: string }[] = [];
-
-  if (words.length > 0) {
-    // Group words into chunks of 5-8 words per segment
-    // This provides better granularity for viral moment detection than whole sentences sometimes
+  if (resultData?.paragraphs?.paragraphs) {
+    resultData.paragraphs.paragraphs.forEach((p: any) => {
+      p.sentences.forEach((s: any) => {
+        segments.push({
+          start: s.start,
+          end: s.end,
+          text: s.text
+        });
+      });
+    });
+  } else if (words.length > 0) {
+    // Fallback to chunking words if paragraphs are not available
+    console.log("[transcribe] No paragraph data, falling back to word chunking for segments.");
     const CHUNK_SIZE = 8;
     for (let i = 0; i < words.length; i += CHUNK_SIZE) {
       const chunk = words.slice(i, i + CHUNK_SIZE);
@@ -100,19 +167,28 @@ interface CaptionSegment {
 function generateCaptions(words: any[]): CaptionSegment[] {
   const captions: CaptionSegment[] = [];
   let currentCaption: any[] = [];
-  let currentDuration = 0;
 
   for (const w of words) {
     currentCaption.push(w);
     const duration = w.end - currentCaption[0].start;
+    const wordText = w.punctuated_word || w.word;
+    const endsWithPunctuation = /[.!?,;:]$/.test(wordText);
 
-    // Rules: 3-6 words OR > 2.5s duration
-    if (currentCaption.length >= 6 || duration > 2.5 || (w.word.match(/[.!?]$/) && currentCaption.length >= 3)) {
+    // Rules: max 5 words OR > 2s duration OR punctuation after 3+ words
+    if (
+      currentCaption.length >= 5 ||
+      duration > 2.0 ||
+      (endsWithPunctuation && currentCaption.length >= 3)
+    ) {
       captions.push({
         start: currentCaption[0].start,
         end: currentCaption[currentCaption.length - 1].end,
-        text: currentCaption.map((cw) => cw.punctuated_word || cw.word).join(" "),
-        words: currentCaption
+        text: currentCaption.map((cw: any) => cw.punctuated_word || cw.word).join(" "),
+        words: currentCaption.map((cw: any) => ({
+          word: cw.punctuated_word || cw.word,
+          start: cw.start,
+          end: cw.end
+        }))
       });
       currentCaption = [];
     }
@@ -123,11 +199,16 @@ function generateCaptions(words: any[]): CaptionSegment[] {
     captions.push({
       start: currentCaption[0].start,
       end: currentCaption[currentCaption.length - 1].end,
-      text: currentCaption.map((cw) => cw.punctuated_word || cw.word).join(" "),
-      words: currentCaption
+      text: currentCaption.map((cw: any) => cw.punctuated_word || cw.word).join(" "),
+      words: currentCaption.map((cw: any) => ({
+        word: cw.punctuated_word || cw.word,
+        start: cw.start,
+        end: cw.end
+      }))
     });
   }
 
+  console.log(`[captions] generated ${captions.length} caption segments`);
   return captions;
 }
 
@@ -294,7 +375,8 @@ serve(async (req) => {
     await logStep("transcribing", "Starting Deepgram transcription (nova-2)...");
     await updateStatus("transcribing");
 
-    const { transcript, duration, segments, words } = await transcribeVideo(videoUrlForDeepgram, deepgramKey);
+    const transcriptionResult = await transcribeVideo(videoUrlForDeepgram, deepgramKey);
+    const { transcript, duration, segments, words } = transcriptionResult;
 
     // Generate Captions (3-6 words, max 2.5s)
     const captions = generateCaptions(words);
@@ -323,22 +405,53 @@ serve(async (req) => {
       vtt_file_url: vttData.publicUrl,
     }).eq("id", rawVideo.id);
 
-    await logStep("transcribing", `Transcription complete – ${segments.length} segments, duration: ${duration}s`);
+    await logStep("transcribing", `Transcription complete – ${transcriptionResult.segments.length} segments, duration: ${transcriptionResult.duration}s`);
     await updateStatus("transcribed");
 
     // ── STEP 2: Detect Viral Moment ─────────────────────────────────────
-    await logStep("detecting", "Analyzing transcript for viral moments...");
-    await updateStatus("detecting");
+    let viralMoment = {
+      start_time: 0,
+      end_time: 10, // Default fallback
+      hook_text: "Viral Clip",
+      captions: "Watch this!",
+      reason: "Default fallback due to transcription failure"
+    };
 
-    // STEP 7 -- ADD LOGGING
-    console.log(`[detect] received segments count = ${segments.length}`);
+    if (transcriptionResult.warning || !transcriptionResult.transcript || transcriptionResult.transcript.length < 10) {
+      console.warn(`[pipeline] Skipping viral detection due to empty transcript.`);
+      // Use safe default: start 0, end min(10, duration)
+      const safeEnd = transcriptionResult.duration > 0 ? Math.min(transcriptionResult.duration, 60) : 10;
 
-    const viralMoment = await detectViralMoment(segments, lovableKey);
+      viralMoment = {
+        start_time: 0,
+        end_time: safeEnd,
+        hook_text: "My Video",
+        captions: "Transcription unavailable",
+        reason: "Transcription fallback"
+      };
+
+      await updateStatus("analysis_skipped"); // You might want to define this status or reuse another
+    } else {
+      await logStep("detecting", "Analyzing transcript for viral moments...");
+      await updateStatus("analyzing");
+
+      try {
+        console.log(`[detect] received segments count = ${transcriptionResult.segments.length}`);
+        const detected = await detectViralMoment(transcriptionResult.segments, Deno.env.get("LOVABLE_API_KEY")!);
+        viralMoment = detected;
+        await logStep("detecting", `Viral moment found: ${viralMoment.reason}`);
+        await updateStatus("segment_selected");
+      } catch (err: any) {
+        console.error(`[detecting] Failed: ${err.message}. Using default.`);
+        // Fallback if detection APi fails
+        viralMoment.end_time = transcriptionResult.duration > 0 ? Math.min(transcriptionResult.duration, 60) : 15;
+        await logStep("detecting", `Viral moment detection failed, using fallback: ${err.message}`);
+        await updateStatus("analysis_failed");
+      }
+    }
 
     console.log(`[detect] chosen start=${viralMoment.start_time} end=${viralMoment.end_time}`);
 
-    await logStep("detecting", `Viral moment found: ${viralMoment.reason}`);
-    await updateStatus("segment_selected");
 
     // ── STEP 3: Real clipping (FFmpeg Worker) ───────────────────────────
     await logStep("clipping", "Sending to FFmpeg worker for clipping...");
