@@ -13,6 +13,18 @@ async function transcribeVideo(
 ): Promise<{ start: number; end: number; text: string }[]> {
   console.log("Deepgram: sending URL for transcription:", videoUrl);
 
+  // First, verify the URL is accessible
+  try {
+    const headRes = await fetch(videoUrl, { method: "HEAD" });
+    console.log("Video URL HEAD check:", headRes.status, headRes.headers.get("content-type"), "size:", headRes.headers.get("content-length"));
+    if (!headRes.ok) {
+      throw new Error(`Video URL not accessible: HTTP ${headRes.status}`);
+    }
+  } catch (e) {
+    console.error("Video URL accessibility check failed:", e);
+    throw new Error(`Cannot access video URL: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
   const res = await fetch("https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&utterances=true&punctuate=true", {
     method: "POST",
     headers: {
@@ -29,10 +41,17 @@ async function transcribeVideo(
   }
 
   const data = await res.json();
+  console.log("Deepgram response keys:", JSON.stringify(Object.keys(data)));
+  console.log("Deepgram metadata:", JSON.stringify(data.metadata || {}));
+
+  // Check for full transcript text first
+  const fullText = data.results?.channels?.[0]?.alternatives?.[0]?.transcript || "";
+  console.log("Deepgram transcript length:", fullText.length, "chars");
 
   // Prefer utterances (speaker-aware segments with timestamps)
   const utterances = data.results?.utterances;
   if (utterances && utterances.length > 0) {
+    console.log("Using utterances:", utterances.length);
     return utterances.map((u: any) => ({
       start: u.start as number,
       end: u.end as number,
@@ -42,7 +61,17 @@ async function transcribeVideo(
 
   // Fallback: use word-level data grouped into ~10-word chunks
   const words = data.results?.channels?.[0]?.alternatives?.[0]?.words || [];
-  if (words.length === 0) throw new Error("Deepgram returned empty transcript");
+  console.log("Words count:", words.length);
+
+  if (words.length === 0) {
+    // If we have transcript text but no words, create a single segment
+    if (fullText.length > 0) {
+      console.log("No words but have transcript text, using as single segment");
+      const duration = data.metadata?.duration || 60;
+      return [{ start: 0, end: duration, text: fullText }];
+    }
+    throw new Error("Deepgram returned empty transcript – the video may have no audio track or be in an unsupported format. Ensure the video contains speech audio.");
+  }
 
   const chunks: { start: number; end: number; text: string }[] = [];
   for (let i = 0; i < words.length; i += 10) {
@@ -158,11 +187,29 @@ serve(async (req) => {
 
     if (!rawVideo) throw new Error("No raw video found");
 
+    // Extract storage path from public URL to generate a signed URL for Deepgram
+    const publicUrlPrefix = `${supabaseUrl}/storage/v1/object/public/raw-videos/`;
+    let videoUrlForDeepgram = rawVideo.file_url;
+
+    if (rawVideo.file_url.startsWith(publicUrlPrefix)) {
+      const storagePath = rawVideo.file_url.replace(publicUrlPrefix, "");
+      const { data: signedData, error: signedErr } = await supabase.storage
+        .from("raw-videos")
+        .createSignedUrl(storagePath, 3600); // 1 hour
+      if (signedErr) {
+        console.error("Failed to create signed URL:", signedErr);
+        await logStep("transcribing", "Warning: using public URL (signed URL failed)");
+      } else {
+        videoUrlForDeepgram = signedData.signedUrl;
+        console.log("Using signed URL for Deepgram");
+      }
+    }
+
     // ── STEP 1: Transcribe with Deepgram ────────────────────────────────
     await logStep("transcribing", "Starting Deepgram transcription (nova-2)...");
     await updateStatus("transcribing");
 
-    const transcript = await transcribeVideo(rawVideo.file_url, deepgramKey);
+    const transcript = await transcribeVideo(videoUrlForDeepgram, deepgramKey);
     const fullTranscriptText = transcript.map((t) => t.text).join(" ");
 
     await supabase.from("raw_videos").update({
