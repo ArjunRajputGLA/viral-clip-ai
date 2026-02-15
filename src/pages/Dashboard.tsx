@@ -98,6 +98,9 @@ const Dashboard = () => {
       const { error } = await supabase.from('projects').delete().eq('id', projectId);
       if (error) throw error;
 
+      // Update local state immediately for better UX
+      setProjects(prev => prev.filter(p => p.id !== projectId));
+
       toast({ title: 'Deleted', description: 'Project deleted successfully.' });
     } catch (err: any) {
       toast({ title: 'Delete failed', description: err.message, variant: 'destructive' });

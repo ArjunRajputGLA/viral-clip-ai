@@ -1,3 +1,4 @@
+
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
@@ -10,79 +11,106 @@ const corsHeaders = {
 async function transcribeVideo(
   videoUrl: string,
   deepgramKey: string
-): Promise<{ start: number; end: number; text: string }[]> {
-  console.log("Deepgram: sending URL for transcription:", videoUrl);
+): Promise<{ transcript: string; duration: number; segments: { start: number; end: number; text: string }[] }> {
+  console.log("[transcribe] fetching video from URL:", videoUrl);
 
-  // First, verify the URL is accessible
-  try {
-    const headRes = await fetch(videoUrl, { method: "HEAD" });
-    console.log("Video URL HEAD check:", headRes.status, headRes.headers.get("content-type"), "size:", headRes.headers.get("content-length"));
-    if (!headRes.ok) {
-      throw new Error(`Video URL not accessible: HTTP ${headRes.status}`);
-    }
-  } catch (e) {
-    console.error("Video URL accessibility check failed:", e);
-    throw new Error(`Cannot access video URL: ${e instanceof Error ? e.message : String(e)}`);
+  // STEP 1 -- Validate Video Fetch
+  const videoRes = await fetch(videoUrl);
+  console.log("[transcribe] video fetch status:", videoRes.status);
+  const contentType = videoRes.headers.get("content-type");
+  console.log("[transcribe] content-type:", contentType);
+
+  if (!videoRes.ok) {
+    throw new Error(`Failed to fetch video: ${videoRes.status} ${videoRes.statusText}`);
   }
 
-  const res = await fetch("https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&utterances=true&punctuate=true", {
+  const videoBuffer = await videoRes.arrayBuffer();
+  const byteLength = videoBuffer.byteLength;
+  console.log("[transcribe] video size:", byteLength, "bytes");
+
+  if (byteLength === 0 || (contentType && !contentType.startsWith("video/") && !contentType.startsWith("audio/") && !contentType.startsWith("application/octet-stream"))) {
+     // Note: application/octet-stream is common for signed URLs or generic storage
+    console.warn("[transcribe] Warning: unexpected content-type", contentType);
+    if (byteLength === 0) throw new Error("Invalid video fetch: empty file");
+  }
+  
+  // STEP 6 -- Fail Fast
+  if (byteLength < 10 * 1024) { // 10KB
+    throw new Error("Video file too small or invalid (< 10KB)");
+  }
+
+  // STEP 2 -- Send Raw Buffer to Deepgram
+  console.log("[transcribe] sending to Deepgram (nova-2)...");
+  
+  const deepgramRes = await fetch("https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&utterances=true&punctuate=true", {
     method: "POST",
     headers: {
       Authorization: `Token ${deepgramKey}`,
-      "Content-Type": "application/json",
+      "Content-Type": "application/octet-stream",
     },
-    body: JSON.stringify({ url: videoUrl }),
+    body: new Uint8Array(videoBuffer),
   });
 
-  if (!res.ok) {
-    const errBody = await res.text();
-    console.error("Deepgram error:", res.status, errBody);
-    throw new Error(`Deepgram API error: ${res.status} – ${errBody}`);
+  // STEP 3 -- Handle Response Safely
+  if (!deepgramRes.ok) {
+    const errBody = await deepgramRes.text();
+    console.error("[transcribe] Deepgram error:", deepgramRes.status, errBody);
+    throw new Error(`Deepgram API error: ${deepgramRes.status} – ${errBody}`);
   }
 
-  const data = await res.json();
-  console.log("Deepgram response keys:", JSON.stringify(Object.keys(data)));
-  console.log("Deepgram metadata:", JSON.stringify(data.metadata || {}));
+  const data = await deepgramRes.json();
+  console.log("[transcribe] Deepgram response received");
 
-  // Check for full transcript text first
-  const fullText = data.results?.channels?.[0]?.alternatives?.[0]?.transcript || "";
-  console.log("Deepgram transcript length:", fullText.length, "chars");
+  const duration = data.metadata?.duration || 0;
+  console.log("[transcribe] Deepgram duration:", duration);
 
+  const transcriptText = data.results?.channels?.[0]?.alternatives?.[0]?.transcript || "";
+  console.log("[transcribe] transcript length:", transcriptText.length);
+
+  if (!transcriptText || transcriptText.trim() === "") {
+    console.error("[transcribe] Empty transcript. Metadata:", JSON.stringify(data.metadata));
+    throw new Error(`Deepgram returned empty transcript. Duration: ${duration}`);
+  }
+
+  // Extract segments for viral moment detection
+  let segments: { start: number; end: number; text: string }[] = [];
+  
   // Prefer utterances (speaker-aware segments with timestamps)
   const utterances = data.results?.utterances;
   if (utterances && utterances.length > 0) {
-    console.log("Using utterances:", utterances.length);
-    return utterances.map((u: any) => ({
-      start: u.start as number,
-      end: u.end as number,
-      text: u.transcript as string,
+    console.log("[transcribe] Using utterances:", utterances.length);
+    segments = utterances.map((u: any) => ({
+      start: u.start,
+      end: u.end,
+      text: u.transcript,
     }));
-  }
+  } else {
+    // Fallback: use word-level data grouped into ~10-word chunks
+    const words = data.results?.channels?.[0]?.alternatives?.[0]?.words || [];
+    console.log("[transcribe] Words count:", words.length);
 
-  // Fallback: use word-level data grouped into ~10-word chunks
-  const words = data.results?.channels?.[0]?.alternatives?.[0]?.words || [];
-  console.log("Words count:", words.length);
-
-  if (words.length === 0) {
-    // If we have transcript text but no words, create a single segment
-    if (fullText.length > 0) {
-      console.log("No words but have transcript text, using as single segment");
-      const duration = data.metadata?.duration || 60;
-      return [{ start: 0, end: duration, text: fullText }];
+    if (words.length > 0) {
+      for (let i = 0; i < words.length; i += 10) {
+        const slice = words.slice(i, i + 10);
+        segments.push({
+          start: slice[0].start,
+          end: slice[slice.length - 1].end,
+          text: slice.map((w: any) => w.punctuated_word || w.word).join(" "),
+        });
+      }
+    } else {
+       // Deepgram returned transcript but no words/utterances? 
+       // Create one big segment
+       console.log("[transcribe] Fallback: single segment from full text");
+       segments = [{ start: 0, end: duration, text: transcriptText }];
     }
-    throw new Error("Deepgram returned empty transcript – the video may have no audio track or be in an unsupported format. Ensure the video contains speech audio.");
   }
 
-  const chunks: { start: number; end: number; text: string }[] = [];
-  for (let i = 0; i < words.length; i += 10) {
-    const slice = words.slice(i, i + 10);
-    chunks.push({
-      start: slice[0].start,
-      end: slice[slice.length - 1].end,
-      text: slice.map((w: any) => w.punctuated_word || w.word).join(" "),
-    });
-  }
-  return chunks;
+  return {
+    transcript: transcriptText,
+    duration,
+    segments
+  };
 }
 
 // ── Viral Moment Detection (Lovable AI) ─────────────────────────────────
@@ -209,22 +237,21 @@ serve(async (req) => {
     await logStep("transcribing", "Starting Deepgram transcription (nova-2)...");
     await updateStatus("transcribing");
 
-    const transcript = await transcribeVideo(videoUrlForDeepgram, deepgramKey);
-    const fullTranscriptText = transcript.map((t) => t.text).join(" ");
+    const { transcript, duration, segments } = await transcribeVideo(videoUrlForDeepgram, deepgramKey);
 
     await supabase.from("raw_videos").update({
-      transcript: fullTranscriptText,
-      transcript_json: transcript,
+      transcript: transcript,
+      transcript_json: segments,
     }).eq("id", rawVideo.id);
 
-    await logStep("transcribing", `Transcription complete – ${transcript.length} segments`);
+    await logStep("transcribing", `Transcription complete – ${segments.length} segments, duration: ${duration}s`);
     await updateStatus("transcribed");
 
     // ── STEP 2: Detect Viral Moment ─────────────────────────────────────
     await logStep("detecting", "Analyzing transcript for viral moments...");
     await updateStatus("detecting");
 
-    const viralMoment = await detectViralMoment(transcript, lovableKey);
+    const viralMoment = await detectViralMoment(segments, lovableKey);
 
     await logStep("detecting", `Viral moment found: ${viralMoment.reason}`);
     await updateStatus("segment_selected");
