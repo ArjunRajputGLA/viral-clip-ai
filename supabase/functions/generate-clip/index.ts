@@ -13,43 +13,65 @@ async function transcribeVideo(
   deepgramKey: string
 ): Promise<{ transcript: string; duration: number; segments: { start: number; end: number; text: string }[] }> {
   console.log("[transcribe] fetching video from URL:", videoUrl);
+  console.log(`[debug] DEEPGRAM_API_KEY length: ${deepgramKey ? deepgramKey.length : "undefined"}`);
+  if (deepgramKey) {
+    console.log(`[debug] DEEPGRAM_API_KEY starts with: ${deepgramKey.substring(0, 4)}...`);
+  } else {
+    console.error("[error] DEEPGRAM_API_KEY is missing or empty");
+  }
 
   // STEP 1 -- Validate Video Fetch
   const videoRes = await fetch(videoUrl);
   console.log("[transcribe] video fetch status:", videoRes.status);
   const contentType = videoRes.headers.get("content-type");
+  const contentLength = videoRes.headers.get("content-length");
   console.log("[transcribe] content-type:", contentType);
+  console.log("[transcribe] content-length:", contentLength);
 
   if (!videoRes.ok) {
     throw new Error(`Failed to fetch video: ${videoRes.status} ${videoRes.statusText}`);
   }
 
-  const videoBuffer = await videoRes.arrayBuffer();
-  const byteLength = videoBuffer.byteLength;
-  console.log("[transcribe] video size:", byteLength, "bytes");
+  // Check content length if available
+  const estimatedSize = contentLength ? parseInt(contentLength, 10) : 0;
 
-  if (byteLength === 0 || (contentType && !contentType.startsWith("video/") && !contentType.startsWith("audio/") && !contentType.startsWith("application/octet-stream"))) {
-     // Note: application/octet-stream is common for signed URLs or generic storage
-    console.warn("[transcribe] Warning: unexpected content-type", contentType);
-    if (byteLength === 0) throw new Error("Invalid video fetch: empty file");
-  }
-  
-  // STEP 6 -- Fail Fast
-  if (byteLength < 10 * 1024) { // 10KB
+  if (estimatedSize > 0 && estimatedSize < 10 * 1024) { // 10KB
     throw new Error("Video file too small or invalid (< 10KB)");
   }
 
-  // STEP 2 -- Send Raw Buffer to Deepgram
-  console.log("[transcribe] sending to Deepgram (nova-2)...");
+  // STEP 2 -- Stream directly to Deepgram to avoid memory issues
+  console.log("[transcribe] sending stream to Deepgram (nova-2)...");
   
-  const deepgramRes = await fetch("https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&utterances=true&punctuate=true", {
-    method: "POST",
-    headers: {
-      Authorization: `Token ${deepgramKey}`,
-      "Content-Type": "application/octet-stream",
-    },
-    body: new Uint8Array(videoBuffer),
-  });
+  // Create a timeout controller - 60 seconds
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 60000);
+
+  let deepgramRes;
+  try {
+    deepgramRes = await fetch("https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&utterances=true&punctuate=true", {
+      method: "POST",
+      headers: {
+        Authorization: `Token ${deepgramKey}`,
+        // Note: deepgram handles chunked transfer encoding automatically
+        // but some environments might require Content-Length if streaming
+      },
+      // Pass the readable stream directly
+      body: videoRes.body,
+      signal: controller.signal,
+      // duplex: 'half' is required for streaming request bodies in some environments
+      // @ts-ignore - Deno's fetch type might not include duplex yet
+      duplex: "half", 
+    });
+  } catch (err: any) {
+    clearTimeout(timeoutId);
+    if (err.name === 'AbortError') {
+      console.error("[transcribe] Deepgram request timed out after 60s");
+      throw new Error("Deepgram transcription timed out (60s)");
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 
   // STEP 3 -- Handle Response Safely
   if (!deepgramRes.ok) {
@@ -188,12 +210,24 @@ async function detectViralMoment(
 serve(async (req) => {
   if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
+  let projectId: string | null = null;
+
   try {
-    const { project_id } = await req.json();
+    const requestBody = await req.json();
+    projectId = requestBody.project_id;
+    const project_id = projectId; // Alias for compatibility with existing code
+
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
     const lovableKey = Deno.env.get("LOVABLE_API_KEY")!;
     const deepgramKey = Deno.env.get("DEEPGRAM_API_KEY");
+
+    // Debugging: Log key status (never log full key)
+    if (!deepgramKey) {
+       console.error("DEEPGRAM_API_KEY is completely missing from environment variables.");
+    } else {
+       console.log(`DEEPGRAM_API_KEY found (Length: ${deepgramKey.length}, Starts with: ${deepgramKey.substring(0, 4)}...)`);
+    }
 
     if (!deepgramKey) throw new Error("DEEPGRAM_API_KEY is not configured");
 
@@ -288,16 +322,29 @@ serve(async (req) => {
     const errMsg = e instanceof Error ? e.message : "Unknown error";
 
     // Try to set project status to error so frontend can show it
-    try {
-      const { project_id } = await req.clone().json().catch(() => ({ project_id: null }));
-      if (project_id) {
+    if (projectId) {
+      console.log(`Reporting error for project ${projectId}: ${errMsg}`);
+      try {
         const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
         const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
         const sb = createClient(supabaseUrl, supabaseKey);
-        await sb.from("processing_logs").insert({ project_id, step: "error", message: errMsg });
-        await sb.from("projects").update({ status: "error", updated_at: new Date().toISOString() }).eq("id", project_id);
+        
+        await sb.from("processing_logs").insert({ 
+          project_id: projectId, 
+          step: "error", 
+          message: errMsg 
+        });
+        
+        await sb.from("projects").update({ 
+          status: "error", 
+          updated_at: new Date().toISOString() 
+        }).eq("id", projectId);
+      } catch (logErr) { 
+        console.error("Failed to log error to DB:", logErr);
       }
-    } catch { /* best effort */ }
+    } else {
+      console.error("No project_id available to log error");
+    }
 
     return new Response(JSON.stringify({ error: errMsg }), {
       status: 500,
