@@ -48,7 +48,12 @@ const Processing = () => {
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'projects', filter: `id=eq.${id}` }, (payload) => {
         const updated = payload.new as Tables<'projects'>;
         setProject(updated);
+        // If status changed to error, fetch logs immediately
+        if (updated.status === 'error') fetchData();
         if (updated.status === 'ready') navigate(`/preview/${id}`, { replace: true });
+      })
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'processing_logs', filter: `project_id=eq.${id}` }, () => {
+        fetchData();
       })
       .subscribe();
 
