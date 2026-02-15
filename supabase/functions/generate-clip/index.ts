@@ -211,7 +211,21 @@ serve(async (req) => {
     });
   } catch (e) {
     console.error("generate-clip error:", e);
-    return new Response(JSON.stringify({ error: e instanceof Error ? e.message : "Unknown error" }), {
+    const errMsg = e instanceof Error ? e.message : "Unknown error";
+
+    // Try to set project status to error so frontend can show it
+    try {
+      const { project_id } = await req.clone().json().catch(() => ({ project_id: null }));
+      if (project_id) {
+        const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+        const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+        const sb = createClient(supabaseUrl, supabaseKey);
+        await sb.from("processing_logs").insert({ project_id, step: "error", message: errMsg });
+        await sb.from("projects").update({ status: "error", updated_at: new Date().toISOString() }).eq("id", project_id);
+      }
+    } catch { /* best effort */ }
+
+    return new Response(JSON.stringify({ error: errMsg }), {
       status: 500,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
