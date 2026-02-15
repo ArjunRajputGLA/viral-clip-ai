@@ -39,59 +39,56 @@ async function transcribeVideo(
     throw new Error("Video file too small or invalid (< 10KB)");
   }
 
-  // STEP 2 -- Stream directly to Deepgram to avoid memory issues
-  console.log("[transcribe] sending stream to Deepgram (nova-2)...");
-  
-  // Create a timeout controller - 60 seconds
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 60000);
+  // STEP 2 -- Send URL directly to Deepgram
+  console.log("[transcribe] sending URL to Deepgram (nova-2)...");
 
-  let deepgramRes;
-  try {
-    deepgramRes = await fetch("https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&utterances=true&punctuate=true", {
+  let deepgramRes = await fetch("https://api.deepgram.com/v1/listen?model=nova-2&path=nova-2&smart_format=true&utterances=true&detect_language=true", {
       method: "POST",
       headers: {
         Authorization: `Token ${deepgramKey}`,
-        // Note: deepgram handles chunked transfer encoding automatically
-        // but some environments might require Content-Length if streaming
+        "Content-Type": "application/json",
       },
-      // Pass the readable stream directly
-      body: videoRes.body,
-      signal: controller.signal,
-      // duplex: 'half' is required for streaming request bodies in some environments
-      // @ts-ignore - Deno's fetch type might not include duplex yet
-      duplex: "half", 
-    });
-  } catch (err: any) {
-    clearTimeout(timeoutId);
-    if (err.name === 'AbortError') {
-      console.error("[transcribe] Deepgram request timed out after 60s");
-      throw new Error("Deepgram transcription timed out (60s)");
-    }
-    throw err;
-  } finally {
-    clearTimeout(timeoutId);
+      body: JSON.stringify({ url: videoUrl }),
+  });
+
+  let data = await deepgramRes.json();
+  let transcriptText = data.results?.channels?.[0]?.alternatives?.[0]?.transcript || "";
+  
+  // Fallback to 'general' model if nova-2 fails to find speech
+  if (!transcriptText || transcriptText.trim() === "") {
+     console.log("[transcribe] nova-2 returned empty. Retrying with 'general' model...");
+     deepgramRes = await fetch("https://api.deepgram.com/v1/listen?model=general&tier=enhanced&punctuate=true&detect_language=true", {
+        method: "POST",
+        headers: {
+          Authorization: `Token ${deepgramKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ url: videoUrl }),
+     });
+     
+     if (deepgramRes.ok) {
+        data = await deepgramRes.json();
+        transcriptText = data.results?.channels?.[0]?.alternatives?.[0]?.transcript || "";
+        console.log("[transcribe] General model transcript length:", transcriptText.length);
+     }
   }
 
   // STEP 3 -- Handle Response Safely
-  if (!deepgramRes.ok) {
-    const errBody = await deepgramRes.text();
-    console.error("[transcribe] Deepgram error:", deepgramRes.status, errBody);
-    throw new Error(`Deepgram API error: ${deepgramRes.status} – ${errBody}`);
-  }
-
-  const data = await deepgramRes.json();
-  console.log("[transcribe] Deepgram response received");
-
   const duration = data.metadata?.duration || 0;
   console.log("[transcribe] Deepgram duration:", duration);
 
-  const transcriptText = data.results?.channels?.[0]?.alternatives?.[0]?.transcript || "";
   console.log("[transcribe] transcript length:", transcriptText.length);
 
   if (!transcriptText || transcriptText.trim() === "") {
     console.error("[transcribe] Empty transcript. Metadata:", JSON.stringify(data.metadata));
-    throw new Error(`Deepgram returned empty transcript. Duration: ${duration}`);
+    console.error("[transcribe] Full response structure:", JSON.stringify(data)); // Log full data for debugging
+    
+    const channel0 = data.results?.channels?.[0];
+    const alt0 = channel0?.alternatives?.[0];
+    const confidence = alt0?.confidence || 0;
+    
+    // Provide a more helpful error
+    throw new Error(`Deepgram returned empty transcript. Duration: ${duration}s. Confidence: ${confidence}. Content-Type: ${contentType}. Ensure video has clear English speech.`);
   }
 
   // Extract segments for viral moment detection
