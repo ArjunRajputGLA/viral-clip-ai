@@ -5,6 +5,7 @@ import { Navbar } from '@/components/Navbar';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Download, Calendar, Sparkles, Clock, Captions } from 'lucide-react';
+import { VideoPlayer } from '@/components/VideoPlayer';
 import type { Tables } from '@/integrations/supabase/types';
 
 const Preview = () => {
@@ -44,19 +45,11 @@ const Preview = () => {
         <div className="grid gap-8 lg:grid-cols-5">
           {/* Video Player */}
           <div className="lg:col-span-3">
-            <div className="glass overflow-hidden rounded-2xl">
-              {generatedVideo?.video_url ? (
-                <video
-                  src={generatedVideo.video_url}
-                  controls
-                  className="aspect-[9/16] w-full max-h-[500px] object-contain bg-black"
-                />
-              ) : (
-                <div className="flex aspect-[9/16] max-h-[500px] items-center justify-center bg-muted">
-                  <p className="text-muted-foreground">Video preview</p>
-                </div>
-              )}
-            </div>
+            <VideoPlayer
+              videoUrl={generatedVideo?.video_url || null}
+              captionsJson={(rawVideo as any)?.captions_json}
+              wordTimestamps={(rawVideo as any)?.word_timestamps}
+            />
           </div>
 
           {/* Info Panel */}
