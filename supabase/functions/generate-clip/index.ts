@@ -39,17 +39,11 @@ async function transcribeVideo(
     mediaBuffer = await audioResp.arrayBuffer();
     contentType = "audio/wav";
     console.log(`[transcribe] Using extracted WAV audio (${mediaBuffer.byteLength} bytes)`);
+    console.log("[pipeline] audio extracted OK");
 
-    // 3. Validate Audio Dictionary
+    // 3. Validate audio size — fail fast if too small
     if (mediaBuffer.byteLength < 10000) {
-      console.warn(`[transcribe] Audio file too small (${mediaBuffer.byteLength} bytes). Possibly silent.`);
-      return {
-        transcript: "",
-        duration: 0,
-        segments: [],
-        words: [],
-        warning: "audio_too_small"
-      };
+      throw new Error(`Extracted audio invalid (${mediaBuffer.byteLength} bytes)`);
     }
 
   } catch (err: any) {
@@ -66,6 +60,7 @@ async function transcribeVideo(
 
   const attemptTranscription = async (model: string) => {
     console.log(`[transcribe] Attempting with model: ${model}`);
+    console.log("[pipeline] sending to Deepgram");
     const deepgramResponse = await fetch(`https://api.deepgram.com/v1/listen?model=${model}&smart_format=true&punctuate=true&utterances=true&words=true`, {
       method: "POST",
       headers: {
@@ -148,6 +143,7 @@ async function transcribeVideo(
   }
 
   // STEP 6 -- RETURN STRUCTURED RESULT
+  console.log("[pipeline] transcript received");
   return {
     transcript: transcript,
     duration: duration,
